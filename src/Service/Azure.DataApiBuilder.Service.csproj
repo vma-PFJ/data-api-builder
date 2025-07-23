@@ -112,4 +112,10 @@
         </Content>
     </ItemGroup>
 
+    <ItemGroup>
+      <Content Update="dab-config.json">
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      </Content>
+    </ItemGroup>
+
 </Project>

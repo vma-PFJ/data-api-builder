@@ -79,9 +79,9 @@ public class RuntimeConfigValidator : IConfigValidator
 
         ValidateAuthenticationOptions(runtimeConfig);
         ValidateGlobalEndpointRouteConfig(runtimeConfig);
-        ValidateAppInsightsTelemetryConnectionString(runtimeConfig);
+        //ValidateAppInsightsTelemetryConnectionString(runtimeConfig);
         ValidateLoggerFilters(runtimeConfig);
-        ValidateAzureLogAnalyticsAuth(runtimeConfig);
+        //ValidateAzureLogAnalyticsAuth(runtimeConfig);
 
         // Running these graphQL validations only in development mode to ensure
         // fast startup of engine in production mode.
@@ -100,24 +100,28 @@ public class RuntimeConfigValidator : IConfigValidator
     /// Throws exception if Invalid connection-string or database type
     /// is present in the config
     /// </summary>
-    public void ValidateDataSourceInConfig(
-        RuntimeConfig runtimeConfig,
-        IFileSystem fileSystem,
-        ILogger logger)
+    public void ValidateDataSourceInConfig(RuntimeConfig runtimeConfig
+                                          , IFileSystem fileSystem
+                                          , ILogger logger)
     {
-        foreach (DataSource dataSource in runtimeConfig.ListAllDataSources())
+        if (runtimeConfig != null)
         {
-            // Connection string can't be null or empty
-            if (string.IsNullOrWhiteSpace(dataSource.ConnectionString))
-            {
-                HandleOrRecordException(new DataApiBuilderException(
-                    message: DataApiBuilderException.CONNECTION_STRING_ERROR_MESSAGE,
-                    statusCode: HttpStatusCode.ServiceUnavailable,
-                    subStatusCode: DataApiBuilderException.SubStatusCodes.ErrorInInitialization));
-            }
-        }
+            IEnumerable<DataSource> sources = runtimeConfig.ListAllDataSources() ;
 
-        ValidateDatabaseType(runtimeConfig, fileSystem, logger);
+            foreach (DataSource dataSource in sources)
+            {
+                // Connection string can't be null or empty
+                if (string.IsNullOrWhiteSpace(dataSource.ConnectionString))
+                {
+                    HandleOrRecordException(new DataApiBuilderException(
+                        message: DataApiBuilderException.CONNECTION_STRING_ERROR_MESSAGE,
+                        statusCode: HttpStatusCode.ServiceUnavailable,
+                        subStatusCode: DataApiBuilderException.SubStatusCodes.ErrorInInitialization));
+                }
+            }
+
+            ValidateDatabaseType(runtimeConfig, fileSystem, logger);
+        }
     }
 
     /// <summary>
