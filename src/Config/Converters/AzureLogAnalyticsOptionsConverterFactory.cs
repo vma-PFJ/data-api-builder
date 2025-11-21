@@ -12,9 +12,8 @@ namespace Azure.DataApiBuilder.Config.Converters;
 /// </summary>
 internal class AzureLogAnalyticsOptionsConverterFactory : JsonConverterFactory
 {
-    // Determines whether to replace environment variable with its
-    // value or not while deserializing.
-    private bool _replaceEnvVar;
+    // Settings for variable replacement during deserialization.
+    private readonly DeserializationVariableReplacementSettings? _replacementSettings;
 
     /// <inheritdoc/>
     public override bool CanConvert(Type typeToConvert)
@@ -25,27 +24,26 @@ internal class AzureLogAnalyticsOptionsConverterFactory : JsonConverterFactory
     /// <inheritdoc/>
     public override JsonConverter? CreateConverter(Type typeToConvert, JsonSerializerOptions options)
     {
-        return new AzureLogAnalyticsOptionsConverter(_replaceEnvVar);
+        return new AzureLogAnalyticsOptionsConverter(_replacementSettings);
     }
 
-    /// <param name="replaceEnvVar">Whether to replace environment variable with its
-    /// value or not while deserializing.</param>
-    internal AzureLogAnalyticsOptionsConverterFactory(bool replaceEnvVar)
+    /// <param name="replacementSettings">Settings for variable replacement during deserialization.
+    /// If null, no variable replacement will be performed.</param>
+    internal AzureLogAnalyticsOptionsConverterFactory(DeserializationVariableReplacementSettings? replacementSettings = null)
     {
-        _replaceEnvVar = replaceEnvVar;
+        _replacementSettings = replacementSettings;
     }
 
     private class AzureLogAnalyticsOptionsConverter : JsonConverter<AzureLogAnalyticsOptions>
     {
-        // Determines whether to replace environment variable with its
-        // value or not while deserializing.
-        private bool _replaceEnvVar;
+        // Settings for variable replacement during deserialization.
+        private readonly DeserializationVariableReplacementSettings? _replacementSettings;
 
-        /// <param name="replaceEnvVar">Whether to replace environment variable with its
-        /// value or not while deserializing.</param>
-        internal AzureLogAnalyticsOptionsConverter(bool replaceEnvVar)
+        /// <param name="replacementSettings">Settings for variable replacement during deserialization.
+        /// If null, no variable replacement will be performed.</param>
+        internal AzureLogAnalyticsOptionsConverter(DeserializationVariableReplacementSettings? replacementSettings)
         {
-            _replaceEnvVar = replaceEnvVar;
+            _replacementSettings = replacementSettings;
         }
 
         /// <summary>
@@ -57,7 +55,7 @@ internal class AzureLogAnalyticsOptionsConverterFactory : JsonConverterFactory
         {
             if (reader.TokenType is JsonTokenType.StartObject)
             {
-                AzureLogAnalyticsAuthOptionsConverter authOptionsConverter = new(_replaceEnvVar);
+                AzureLogAnalyticsAuthOptionsConverter authOptionsConverter = new(_replacementSettings);
 
                 bool? enabled = null;
                 AzureLogAnalyticsAuthOptions? auth = null;
@@ -88,10 +86,10 @@ internal class AzureLogAnalyticsOptionsConverterFactory : JsonConverterFactory
                             auth = authOptionsConverter.Read(ref reader, typeToConvert, options);
                             break;
 
-                        case "log-type":
+                        case "dab-identifier":
                             if (reader.TokenType is not JsonTokenType.Null)
                             {
-                                logType = reader.DeserializeString(_replaceEnvVar);
+                                logType = reader.DeserializeString(_replacementSettings);
                             }
 
                             break;
@@ -141,7 +139,7 @@ internal class AzureLogAnalyticsOptionsConverterFactory : JsonConverterFactory
                 JsonSerializer.Serialize(writer, value.Enabled, options);
             }
 
-            if (value?.Auth is not null)
+            if (value?.Auth is not null && (value.Auth.UserProvidedCustomTableName || value.Auth.UserProvidedDcrImmutableId || value.Auth.UserProvidedDceEndpoint))
             {
                 AzureLogAnalyticsAuthOptionsConverter authOptionsConverter = options.GetConverter(typeof(AzureLogAnalyticsAuthOptions)) as AzureLogAnalyticsAuthOptionsConverter ??
                                     throw new JsonException("Failed to get azure-log-analytics.auth options converter");
@@ -150,10 +148,10 @@ internal class AzureLogAnalyticsOptionsConverterFactory : JsonConverterFactory
                 authOptionsConverter.Write(writer, value.Auth, options);
             }
 
-            if (value?.UserProvidedLogType is true)
+            if (value?.UserProvidedDabIdentifier is true)
             {
-                writer.WritePropertyName("log-type");
-                JsonSerializer.Serialize(writer, value.LogType, options);
+                writer.WritePropertyName("dab-identifier");
+                JsonSerializer.Serialize(writer, value.DabIdentifier, options);
             }
 
             if (value?.UserProvidedFlushIntervalSeconds is true)

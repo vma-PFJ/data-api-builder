@@ -24,11 +24,14 @@ using Azure.DataApiBuilder.Core.Services.Cache;
 using Azure.DataApiBuilder.Core.Services.MetadataProviders;
 using Azure.DataApiBuilder.Core.Services.OpenAPI;
 using Azure.DataApiBuilder.Core.Telemetry;
+using Azure.DataApiBuilder.Mcp.Core;
 using Azure.DataApiBuilder.Service.Controllers;
 using Azure.DataApiBuilder.Service.Exceptions;
 using Azure.DataApiBuilder.Service.HealthCheck;
 using Azure.DataApiBuilder.Service.Telemetry;
 using Azure.DataApiBuilder.Service.Utilities;
+using Azure.Identity;
+using Azure.Monitor.Ingestion;
 using HotChocolate;
 using HotChocolate.AspNetCore;
 using HotChocolate.Execution;
@@ -56,6 +59,8 @@ using OpenTelemetry.Logs;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
+using Serilog;
+using Serilog.Core;
 using StackExchange.Redis;
 using ZiggyCreatures.Caching.Fusion;
 using ZiggyCreatures.Caching.Fusion.Backplane.StackExchangeRedis;
@@ -70,9 +75,11 @@ namespace Azure.DataApiBuilder.Service
 
         public static bool IsLogLevelOverriddenByCli;
 
+        public static AzureLogAnalyticsCustomLogCollector CustomLogCollector = new();
         public static ApplicationInsightsOptions AppInsightsOptions = new();
         public static OpenTelemetryOptions OpenTelemetryOptions = new();
         public static AzureLogAnalyticsOptions AzureLogAnalyticsOptions = new();
+        public static FileSinkOptions FileSinkOptions = new();
         public const string NO_HTTPS_REDIRECT_FLAG = "--no-https-redirect";
         private readonly HotReloadEventHandler<HotReloadEventArgs> _hotReloadEventHandler = new();
         private RuntimeConfigProvider? _configProvider;
@@ -171,6 +178,39 @@ namespace Azure.DataApiBuilder.Service
                         })
                         .AddSource(TelemetryTracesHelper.DABActivitySource.Name);
                 });
+            }
+
+            if (runtimeConfigAvailable
+                && runtimeConfig?.Runtime?.Telemetry?.AzureLogAnalytics is not null
+                && IsAzureLogAnalyticsAvailable(runtimeConfig.Runtime.Telemetry.AzureLogAnalytics))
+            {
+                services.AddSingleton<ICustomLogCollector, AzureLogAnalyticsCustomLogCollector>();
+                services.AddSingleton<ILoggerProvider, AzureLogAnalyticsLoggerProvider>();
+                services.AddSingleton(sp =>
+                {
+                    AzureLogAnalyticsOptions options = runtimeConfig.Runtime.Telemetry.AzureLogAnalytics;
+                    ManagedIdentityCredential credential = new();
+                    LogsIngestionClient logsIngestionClient = new(new Uri(options.Auth!.DceEndpoint!), credential);
+                    return new AzureLogAnalyticsFlusherService(options, CustomLogCollector, logsIngestionClient, _logger);
+                });
+                services.AddHostedService(sp => sp.GetRequiredService<AzureLogAnalyticsFlusherService>());
+            }
+
+            if (runtimeConfigAvailable
+                && runtimeConfig?.Runtime?.Telemetry?.File is not null
+                && runtimeConfig.Runtime.Telemetry.File.Enabled)
+            {
+                services.AddSingleton(sp =>
+                {
+                    FileSinkOptions options = runtimeConfig.Runtime.Telemetry.File;
+                    return new LoggerConfiguration().WriteTo.File(
+                        path: options.Path,
+                        rollingInterval: (RollingInterval)Enum.Parse(typeof(RollingInterval), options.RollingInterval),
+                        retainedFileCountLimit: options.RetainedFileCountLimit,
+                        fileSizeLimitBytes: options.FileSizeLimitBytes,
+                        rollOnFileSizeLimit: true);
+                });
+                services.AddSingleton(sp => sp.GetRequiredService<LoggerConfiguration>().MinimumLevel.Verbose().CreateLogger());
             }
 
             services.AddSingleton(implementationFactory: serviceProvider =>
@@ -413,6 +453,9 @@ namespace Azure.DataApiBuilder.Service
             }
 
             services.AddSingleton<DabCacheService>();
+
+            services.AddDabMcpServer(configProvider);
+
             services.AddControllers();
         }
 
@@ -433,7 +476,10 @@ namespace Azure.DataApiBuilder.Service
                 .AddHttpRequestInterceptor<DefaultHttpRequestInterceptor>()
                 .ConfigureSchema((serviceProvider, schemaBuilder) =>
                 {
-                    GraphQLSchemaCreator graphQLService = serviceProvider.GetRequiredService<GraphQLSchemaCreator>();
+                    // The GraphQLSchemaCreator is an application service that is not available on 
+                    // the schema specific service provider, this means we have to get it with 
+                    // the GetRootServiceProvider helper.
+                    GraphQLSchemaCreator graphQLService = serviceProvider.GetRootServiceProvider().GetRequiredService<GraphQLSchemaCreator>();
                     graphQLService.InitializeSchemaAndResolvers(schemaBuilder);
                 })
                 .AddHttpRequestInterceptor<IntrospectionInterceptor>()
@@ -519,6 +565,7 @@ namespace Azure.DataApiBuilder.Service
                 ConfigureApplicationInsightsTelemetry(app, runtimeConfig);
                 ConfigureOpenTelemetry(runtimeConfig);
                 ConfigureAzureLogAnalytics(runtimeConfig);
+                ConfigureFileSink(app, runtimeConfig);
 
                 // Config provided before starting the engine.
                 isRuntimeReady = PerformOnConfigChangeAsync(app).Result;
@@ -626,14 +673,17 @@ namespace Azure.DataApiBuilder.Service
             // without proper authorization headers.
             app.UseClientRoleHeaderAuthorizationMiddleware();
 
-            IRequestExecutorResolver requestExecutorResolver = app.ApplicationServices.GetRequiredService<IRequestExecutorResolver>();
+            IRequestExecutorManager requestExecutorManager = app.ApplicationServices.GetRequiredService<IRequestExecutorManager>();
             _hotReloadEventHandler.Subscribe(
                 "GRAPHQL_SCHEMA_EVICTION_ON_CONFIG_CHANGED",
-                (_, _) => EvictGraphQLSchema(requestExecutorResolver));
+                (_, _) => EvictGraphQLSchema(requestExecutorManager));
 
             app.UseEndpoints(endpoints =>
             {
                 endpoints.MapControllers();
+
+                // Special for MCP
+                endpoints.MapDabMcp(runtimeConfigProvider);
 
                 endpoints
                     .MapGraphQL()
@@ -666,10 +716,10 @@ namespace Azure.DataApiBuilder.Service
         /// <summary>
         /// Evicts the GraphQL schema from the request executor resolver.
         /// </summary>
-        private static void EvictGraphQLSchema(IRequestExecutorResolver requestExecutorResolver)
+        private static void EvictGraphQLSchema(IRequestExecutorManager requestExecutorResolver)
         {
             Console.WriteLine("Evicting old GraphQL schema.");
-            requestExecutorResolver.EvictRequestExecutor();
+            requestExecutorResolver.EvictExecutor();
         }
 
         /// <summary>
@@ -690,8 +740,9 @@ namespace Azure.DataApiBuilder.Service
             }
 
             TelemetryClient? appTelemetryClient = serviceProvider.GetService<TelemetryClient>();
+            Logger? serilogLogger = serviceProvider.GetService<Logger>();
 
-            return Program.GetLoggerFactoryForLogLevel(logLevelInitializer.MinLogLevel, appTelemetryClient, logLevelInitializer);
+            return Program.GetLoggerFactoryForLogLevel(logLevelInitializer.MinLogLevel, appTelemetryClient, logLevelInitializer, serilogLogger);
         }
 
         /// <summary>
@@ -892,8 +943,70 @@ namespace Azure.DataApiBuilder.Service
                     return;
                 }
 
+                bool isAuthIncomplete = false;
+                if (string.IsNullOrEmpty(AzureLogAnalyticsOptions.Auth?.CustomTableName))
+                {
+                    _logger.LogError("Logs won't be sent to Azure Log Analytics because the Custom Table Name is not available in the config file.");
+                    isAuthIncomplete = true;
+                }
+
+                if (string.IsNullOrEmpty(AzureLogAnalyticsOptions.Auth?.DcrImmutableId))
+                {
+                    _logger.LogError("Logs won't be sent to Azure Log Analytics because the DCR Immutable Id is not available in the config file.");
+                    isAuthIncomplete = true;
+                }
+
+                if (string.IsNullOrEmpty(AzureLogAnalyticsOptions.Auth?.DceEndpoint))
+                {
+                    _logger.LogError("Logs won't be sent to Azure Log Analytics because the DCE Endpoint is not available in the config file.");
+                    isAuthIncomplete = true;
+                }
+
+                if (isAuthIncomplete)
+                {
+                    return;
+                }
+
                 // Updating Startup Logger to Log from Startup Class.
                 ILoggerFactory? loggerFactory = Program.GetLoggerFactoryForLogLevel(MinimumLogLevel);
+                _logger = loggerFactory.CreateLogger<Startup>();
+            }
+        }
+
+        /// <summary>
+        /// Configure File Sink based on the loaded runtime configuration. If File Sink
+        /// is enabled, we can track different events and metrics.
+        /// </summary>
+        /// <param name="app">The application builder.</param>
+        /// <param name="runtimeConfig">The provider used to load runtime configuration.</param>
+        private void ConfigureFileSink(IApplicationBuilder app, RuntimeConfig runtimeConfig)
+        {
+            if (runtimeConfig?.Runtime?.Telemetry is not null
+               && runtimeConfig.Runtime.Telemetry.File is not null)
+            {
+                FileSinkOptions = runtimeConfig.Runtime.Telemetry.File;
+
+                if (!FileSinkOptions.Enabled)
+                {
+                    _logger.LogInformation("File is disabled.");
+                    return;
+                }
+
+                if (string.IsNullOrWhiteSpace(FileSinkOptions.Path))
+                {
+                    _logger.LogError("Logs won't be sent to File because the Path is not available in the config file.");
+                    return;
+                }
+
+                Logger? serilogLogger = app.ApplicationServices.GetService<Logger>();
+                if (serilogLogger is null)
+                {
+                    _logger.LogError("Serilog Logger Configuration is not set.");
+                    return;
+                }
+
+                // Updating Startup Logger to Log from Startup Class.
+                ILoggerFactory? loggerFactory = Program.GetLoggerFactoryForLogLevel(logLevel: MinimumLogLevel, serilogLogger: serilogLogger);
                 _logger = loggerFactory.CreateLogger<Startup>();
             }
         }
@@ -1043,6 +1156,18 @@ namespace Azure.DataApiBuilder.Service
             LoggerFilters.AddFilter(typeof(IAuthorizationHandler).FullName);
             LoggerFilters.AddFilter(typeof(IAuthorizationResolver).FullName);
             LoggerFilters.AddFilter("default");
+        }
+
+        /// <summary>
+        /// Helper function that returns if AzureLogAnalytics feature is enabled and properly configured.
+        /// </summary>
+        public static bool IsAzureLogAnalyticsAvailable(AzureLogAnalyticsOptions azureLogAnalyticsOptions)
+        {
+            return azureLogAnalyticsOptions.Auth is not null
+                && azureLogAnalyticsOptions.Enabled
+                && !string.IsNullOrWhiteSpace(azureLogAnalyticsOptions.Auth.CustomTableName)
+                && !string.IsNullOrWhiteSpace(azureLogAnalyticsOptions.Auth.DcrImmutableId)
+                && !string.IsNullOrWhiteSpace(azureLogAnalyticsOptions.Auth.DceEndpoint);
         }
     }
 }
